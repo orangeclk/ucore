@@ -1,0 +1,367 @@
+练习1:
+
+Makefile分析：
+
+注：附录中给出了function.mk文件中所有函数的解析
+
+.SUFFIXES 是make的内置目标名，用来设置make需要检查的后缀
+.DELETE_ON_ERROR 也是内置目标名，使make在发生错误时删除已生成的目标文件
+.SECONDEXPANSION 使得下文中的所有规则的条件语句需要被展开两次
+
+.DEFAULT_GOAL := TARGETS指定了make的默认起始目标，而整个make文件中只有create_target系列函数在向TARGETS中添加内容。
+依照顺序，make第一个执行的create_target语句是$(call create_target,kernel)，我们需要先搞清kernel变量的内容。
+首先，我们载入lib文件夹的信息：
+INCLUDE	+= libs/
+CFLAGS	+= $(addprefix -I,$(INCLUDE))
+LIBDIR	+= libs
+然后将lib/下的源代码文件放入libs packet中。编译指令为cc，参数为$(CFLAGS)。
+$(call add_files_cc,$(call listf_cc,$(LIBDIR)),libs,)
+add_files系列函数会编译源代码生成.d文件和.o文件并将他们存放到packet中，同时也将.o文件存入ALLOBJS中。
+
+再载入kernel模块，将kern/目录下的源代码放入kernel packet中。编译指令为cc，参数为$(CFLAGS) $(KCFLAGS)
+$(call add_files_cc,$(call listf_cc,$(KSRCDIR)),kernel,$(KCFLAGS))
+
+从kernel和libs两个packet中读出.o文件
+KOBJS	= $(call read_packet,kernel libs)
+
+给kernel加上bin/前缀，设置成目标文件
+kernel = $(call totarget,kernel)
+
+指定kernel的依赖并执行命令：
+$(kernel): tools/kernel.ld
+$(kernel): $(KOBJS)
+	@echo + ld $@
+	$(V)$(LD) $(LDFLAGS) -T tools/kernel.ld -o $@ $(KOBJS)
+	@$(OBJDUMP) -S $@ > $(call asmfile,kernel)
+	@$(OBJDUMP) -t $@ | $(SED) '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $(call symfile,kernel)
+
+第一条命令：
+在屏幕上打印+ ld bin/kernel
+第二条命令：
+将KOBJS中的.o文件链接为bin/kernel
+第三条命令：
+将bin/kernel反汇编的结果输入obj/kernel.asm
+第四条命令：
+将bin/kernel的符号表输入obj/kernel.sym
+
+接着kernel被加入TARGETS，完成make的流程逻辑。
+$(call create_target,kernel)
+注意：这里create_target只有一个参数，和function.mk注释中至少要求三个参数的说明不同。就我的判断，create_target仍然能正确运行，但是逻辑的确不太好，如果能把kernel的packet名也传入函数就更好了。不过原有的packet变量kernel已经变了意义，所以不能再用。
+
+接下来我们要把bootfiles加入TARGETS
+查找boot/文件夹下所有的源代码，存入bootfiles
+bootfiles = $(call listf_cc,boot)
+
+编译这些源代码
+$(foreach f,$(bootfiles),$(call cc_compile,$(f),$(CC),$(CFLAGS) -Os -nostdinc))
+
+生成bootblock目标bin/bootblock
+bootblock = $(call totarget,bootblock)
+
+然后是生成bin/bootblock的命令：
+$(bootblock): $(call toobj,$(bootfiles)) | $(call totarget,sign)
+	@echo + ld $@
+	$(V)$(LD) $(LDFLAGS) -N -e start -Ttext 0x7C00 $^ -o $(call toobj,bootblock)
+	@$(OBJDUMP) -S $(call objfile,bootblock) > $(call asmfile,bootblock)
+	@$(OBJCOPY) -S -O binary $(call objfile,bootblock) $(call outfile,bootblock)
+	@$(call totarget,sign) $(call outfile,bootblock) $(bootblock)
+
+观察到$(bootblock)依赖sign，所以make会先执行sign目标
+用hostcc编译tools/sign.c，将生成的.o文件存入sign packet中
+$(call add_files_host,tools/sign.c,sign,sign)
+生成sign目标
+$(call create_target_host,sign,sign)
+
+回头再看$(bootblock)目标的语句：
+第一条命令：
+向屏幕打印+ ld bin/bootblock
+第二条命令：
+链接bootblock对应的.o文件生成bin/bootblock.o
+第三条命令：
+将bootblock对应的.o文件反汇编并存入obj/bootblock.asm
+第四条命令：
+将obj/bootblock.o 复制为二进制 obj/bootblock.out
+第五条命令：
+运行bin/sign，参数为obj/bootblock.out bin/bootblock
+
+定义变量UCOREIMG为bin/ucore.img
+UCOREIMG	:= $(call totarget,ucore.img)
+
+执行目标bin/ucore.img
+$(UCOREIMG): $(kernel) $(bootblock)
+	$(V)dd if=/dev/zero of=$@ count=10000
+	$(V)dd if=$(bootblock) of=$@ conv=notrunc
+	$(V)dd if=$(kernel) of=$@ seek=1 conv=notrunc
+
+第一条命令：
+从磁盘零扇区复制5120000B字节到bin/ucore.img
+第二条命令：
+将bin/bootblock完整复制到bin/ucore.img
+第三条命令：
+将bin/kernel跳过512字节后完整复制到bin/ucore.img
+
+将ucore.img加入TARGETS
+$(call create_target,ucore.img)
+
+
+执行finish_all函数
+先通过ALLOBJS得出所有依赖关系存入ALLDEPS
+ALLDEPS = $$(ALLOBJS:.o=.d)
+再建立所有OBJ和BIN需要的各层目录
+$$(sort $$(dir $$(ALLOBJS)) $(BINDIR)$(SLASH) $(OBJDIR)$(SLASH)):
+	@$(MKDIR) $$@
+
+最后检查依赖并载入依赖
+ifeq ($(call match,$(MAKECMDGOALS),$(IGNORE_ALLDEPS)),0)
+-include $(ALLDEPS)
+endif
+依赖关系会在这里完全展开。
+
+所有的命令都解释完了，下面我要简单介绍一下make执行的流程。
+make先去寻找TARGETS中的目标，找到kernel，bootblock，sign，$(UCOREIMG)等
+以kernel为例，kernel依赖于KOBJS和add_files操作
+add_files操作内部__temp_target__依赖于obj文件和文件目录
+文件目录其实也是目标，位于finish_all展开的排序语句中，执行命令是mkdir -p，建立完整目录
+没一个.o文件都在ALLDEPS中有一个.d依赖，并在-include $(ALLDEPS)中得到展开
+顺着依赖关系，make执行的命令是：
+1 建立需要的目录
+2 add_files编译kernel源文件
+3 执行echo ld等指令生成kernel可执行文件，完成kernel目标
+
+
+
+bootblock合法条件：
+bootblock大小必须正好512B，bootblock的最后两个字节必须是0x55和0xAA
+
+练习2:
+无答题内容，下为实验注记：
+系统提供的make debug命令断点设置得太晚，我们要自行采用gnu在localhost:1234监听启动的方式，才能保证观察到起电时BIOS的全过程
+
+
+练习3:
+首先在16位实模式下开始执行指令
+屏蔽中断
+复位串操作标识位，保证串操作时对串顺序操作
+将数据段、附加段、栈寄存器内容置零
+通过对8042芯片的读写操作打开A20开关，为进入实模式做准备
+载入全局描述符表
+利用长跳指令跳到kernel代码段指令中，后面的代码都被设为32位指令
+将kernel的数据段地址赋给各数据段
+执行bootmain程序，完成整个载入过程
+
+
+
+
+练习4:
+
+1.Bootloader是如何读取硬盘数据的？
+
+waitdisk()
+由于于硬盘速度较慢，程序在运行时经常需要等待硬盘工作完成，这个功能由waitdisk()函数完成
+循环检查IO地址0x1f7，直到发现硬盘可读
+
+readsect(void *dst, uint32_t secno)
+通过0x1f系列I/O地址向硬盘发送逻辑块地址secno，然后读取扇区内容到dst指向的内存中
+
+readseg(uintptr_t va, uint32_t count, uint32_t offset)
+这个函数的功能是从硬盘上零扇区之后的第offset+1个字节开始，拷贝count个字节的内容到va指向的内存中
+readseg参考offset的值，将va前移，使得va与offset指向硬盘位置的扇区开头对齐，再利用readsect进行以扇区为单位的拷贝，直到拷贝在原va位置之后的内容大于等于count字节
+
+2.Bootloader如何加载ELF格式的OS？
+
+Bootloader将Kernel的前八个扇区（一页）存入ELFHDR
+如果发现这八个扇区的内容不是ELF文件，那么程序跳转到bad语句，并将0x8A00输出到两个端口0x8A00和0x8E00
+
+从ELFHDR中读取program header表的位置偏移存入ph
+从ELFHDR中读取program header表的入口数目存入eph
+枚举program header的所有入口ph，将硬盘中每一段ph->p_offset的数据（大小为ph->p_memsz）拷贝到ph->p_va指向的内存虚拟地址中
+进入程序入口的虚拟地址，进入OS
+
+
+
+
+练习5:
+
+实现过程：
+利用系统提供的read_eip()和read_ebp()函数读入eip与ebp
+将打印stackframe的次数上限设为STATCKFRAME_DEPTH，并设置边界条件ebp=0
+打印ebp和eip信息
+利用ss:ebp+8以及更高位置的信息打印栈中函数前四个参数的信息
+调用debuginfo输出stackframe的信息
+利用ss:ebp和ss:ebp+4两个内存位置中存储的值跳转到上一层栈上
+
+最后一行各个数值的含义：
+ebp:0x00007bf8 当前ebp寄存器的值为0x00007bf8
+eip:0x00007d73 当前eip寄存器的值为0x00007d73
+args:0xc031fcfa 0xc08ed88e 0x64e4d08e 0xfa7502a8 ss[ebp+8]以及更高位置上依次存放的前四个函数参数的值
+<unknow>: -- 0x00007d72 – 当前eip-1的值 unkown表示这个eip没有定位到具体的某源代码某语句
+
+
+
+
+练习6:
+
+1:
+中断向量表中一个表项占8字节
+最前两个字节和最后两个字节构成OFFSET 第三个字节和第四个字节是段选择子 通过段选择子能够从GDT中取得相应的段描述符，利用段描述符中储存的终端服务例程的段基址和中断向量表中的OFFSET就可以找到中断处理代码的入口
+
+2:
+利用SETGATE宏将vectors.S中存放的中断向量表按照实验要求的类型和权限存入idt数组中
+将idt的内容通过lidt载入
+
+3:
+处理时钟中断，遇到整百输出信息并复位ticks变量；否则累加ticks变量
+
+
+
+
+tools/function.mk 函数解析
+
+假设目录结构如下
+kern/init/a.c
+kern/init/b.c
+kern/init/c.S
+kern.init/readme.txt
+
+则
+
+listf(#directories, #types)
+listf(kern/init/, c S) 返回
+a.c b.c c.S
+
+toobj(#files[, packet])
+toobj(kern/init/a.c kern/init/b.c, kern)返回
+obj/kern/a.o obj/kern/b.o
+
+todep(#files[, packet])
+todep(kern/init/a.c kern/init/b.c, kern)返回
+obj/kern/a.d obj/kern/b.d
+
+totarget(#files)
+totarget(a b)返回
+bin/a bin/b
+
+packetname(#names)
+packetname(a b)返回
+__objs_a __objs_b
+
+cc_template(file, cc[, flags, dir])
+cc_template(kern/init/a.c, cc, -g, kern])返回
+$$(call todep,kern/init/a.c,kern): kern/init/a.c | $$$$(dir $$$$@)
+	@cc -I$$(dir kern/init/a.c) -g -MM $$< -MT "$$(patsubst %.d,%.o,$$@) $$@"> $$@
+$$(call toobj,kern/init/a.c,kern): kern/init/a.c | $$$$(dir $$$$@)
+	@echo + cc $$<
+	$(V)cc -I$$(dir kern/init/a.c) -g -c $$< -o $$@
+ALLOBJS += $$(call toobj,kern/init/a.c,kern)
+
+do_cc_compile(#files, cc[, flags, dir])
+do_cc_compile(kern/init/a.c kern/init/b.c, cc, -g, kern])返回
+$(foreach f, kern/init/a.c kern/init/b.c, $(eval $(call cc_template, $(f), cc, -g, kern)))
+即
+$(call todep,kern/init/a.c,kern): kern/init/a.c | $$(dir $$@)
+	@cc -I$(dir kern/init/a.c) -g -MM $< -MT "$(patsubst %.d,%.o,$@) $@"> $@
+$(call toobj,kern/init/a.c,kern): kern/init/a.c | $$(dir $$@)
+	@echo + cc $<
+	$(V)cc -I$(dir kern/init/a.c) -g -c $< -o $@
+ALLOBJS += $(call toobj,kern/init/a.c,kern)
+$(call todep,kern/init/a.c,kern): kern/init/b.c | $$(dir $$@)
+	@cc -I$(dir kern/init/b.c) -g -MM $< -MT "$(patsubst %.d,%.o,$@) $@"> $@
+$(call toobj,kern/init/a.c,kern): kern/init/b.c | $$(dir $$@)
+	@echo + cc $<
+	$(V)cc -I$(dir kern/init/b.c) -g -c $< -o $@
+ALLOBJS += $(call toobj,kern/init/b.c,kern)
+
+do_add_files_to_packet(#files, cc[, flags, packet, dir])
+do_add_files_to_packet(kern/init/a.c kern/init/b.c, cc, -g, kern, kern/init)返回
+__temp_packet__ := $(call packetname,kern)
+ifeq ($$(origin $$(__temp_packet__)),undefined)
+$$(__temp_packet__) :=
+endif
+__temp_objs__ := $(call toobj,kern/init/a.c kern/init/b.c,kern/init)
+$$(foreach f,kern/init/a.c kern/init/b.c,$$(eval $$(call cc_template,$$(f),cc,-g,kern/init)))
+$$(__temp_packet__) += $$(__temp_objs__)
+
+do_add_objs_to_packet(#objs, packet)
+do_add_objs_to_packet(a b, kern)返回
+__temp_packet__ := $(call packetname,kern)
+ifeq ($$(origin $$(__temp_packet__)),undefined)
+$$(__temp_packet__) :=
+endif
+$$(__temp_packet__) += a b
+
+do_create_target(target, #packets, #objs[, cc, flags])
+do_create_target(main, kern tool, a b, cc, -g)返回
+__temp_target__ = $(call totarget,main)
+__temp_objs__ = $$(foreach p,$(call packetname,kern tool),$$($$(p))) a b
+TARGETS += $$(__temp_target__)
+ifneq (cc,)
+$$(__temp_target__): $$(__temp_objs__) | $$$$(dir $$$$@)
+	$(V)cc -g $$^ -o $$@
+else
+$$(__temp_target__): $$(__temp_objs__) | $$$$(dir $$$$@)
+endif
+
+do_finish_all
+返回
+ALLDEPS = $$(ALLOBJS:.o=.d)
+$$(sort $$(dir $$(ALLOBJS)) $(BINDIR)$(SLASH) $(OBJDIR)$(SLASH)):
+	@$(MKDIR) $$@
+
+cc_compile(#files, cc[, flags, dir])
+cc_compile(kern/init/a.c kern/init/b.c, cc, -g, kern)返回
+obj/kern/a.d: kern/init/a.c | obj/kern/
+	@cc -Ikern/init/ -g -MM $< -MT "obj/kern/a.o a.d"> a.d
+obj/kern/a.o: kern/init/a.c | obj/kern/
+	@echo + cc kern/init/a.c
+	@cc -Ikern/init/ -g -c kern/init/a.c -o obj/kern/a.o
+ALLOBJS += obj/kern/a.o
+obj/kern/b.d: kern/init/b.c | obj/kern/
+	@cc -Ikern/init/ -g -MM $< -MT "obj/kern/b.o b.d"> b.d
+obj/kern/b.o: kern/init/b.c | obj/kern/
+	@echo + cc kern/init/b.c
+	@cc -Ikern/init/ -g -c kern/init/b.c -o obj/kern/b.o
+ALLOBJS += obj/kern/b.o
+
+add_files(#files, cc[, flags, packet, dir])
+add_files(kern/init/a.c kern/init/b.c, cc, -g, kern, kern/init)返回
+__temp_packet__ := __objs_kern
+ifeq ($(origin $(__temp_packet__)),undefined)
+$(__temp_packet__) :=
+endif
+__temp_objs__ := obj/kern/init/a.o obj/kern/init/b.o
+$(foreach f,kern/init/a.c kern/init/b.c,$(eval $(call cc_template,$(f),cc,-g,kern/init)))
+$(__temp_packet__) += $(__temp_objs__)
+
+add_objs(#objs, packet)
+add_objs(a b, kern)返回
+__temp_packet__ := __objs_kern
+ifeq ($(origin $(__temp_packet__)),undefined)
+$(__temp_packet__) :=
+endif
+$(__temp_packet__) += a b
+
+create_target(target, #packes, #objs, cc, [, flags])
+create_target(main, kern tool, a b, cc, -g)
+__temp_target__ = bin/main
+__temp_objs__ = $(foreach p,__objs_kern __objs_tool,$($(p))) a b
+TARGETS += $(__temp_target__)
+ifneq (cc,)
+$(__temp_target__): $(__temp_objs__) | $$(dir $$@)
+	@cc -g $^ -o $@
+else
+$(__temp_target__): $(__temp_objs__) | $$(dir $$@)
+endif
+
+read_packet(#packets)
+read_packet(kern tool)返回
+$($(__objs_kern)) $($(__objs_tool))
+即两个packet中的.o文件
+
+add_dependency(tar, dep)
+add_dependency(main, kern/init/a.c)返回
+main:kern/init/a.c
+
+finish_all返回
+ALLDEPS = $(ALLOBJS:.o=.d)
+$(sort $(dir $(ALLOBJS)) bin/ obj/):
+	@mkdir -p $@
